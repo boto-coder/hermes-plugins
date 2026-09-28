@@ -14,8 +14,16 @@ import time
 import subprocess
 from pathlib import Path
 
+import importlib.util as _iu, os as _os
+_spec = _iu.spec_from_file_location("evey_utils", _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py"))
+_eu = _iu.module_from_spec(_spec)
+_spec.loader.exec_module(_eu)
+call_llm = _eu.call_llm
+
 SOUL_PATH = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "SOUL.md"
 MAX_LEARNED = 10  # Max learned behaviors to keep
+
+# Uses this profile's configured model via _resolve_model in call_llm
 
 SCHEMA = {
     "name": "update_identity",
@@ -52,6 +60,8 @@ Rules:
 
 Behavioral rule:"""
 
+EMPTY_RESULT = "<<<NO_RULE>>>"
+
 
 def _hermes_config():
     """Read this Hermes profile's configured model."""
@@ -69,14 +79,10 @@ def _hermes_config():
 
 def _extract_rule(reflection):
     """Use this profile's configured model to distill reflection into a rule."""
-    model = _hermes_config()
-    if not model:
-        return None
-    import importlib.util as _iu, os as _os
-    _spec = _iu.spec_from_file_location("evey_utils", _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py"))
-    _eu = _iu.module_from_spec(_spec)
-    _spec.loader.exec_module(_eu)
-    return _eu.call_llm(model, REFLECT_PROMPT.format(reflection=reflection), max_tokens=50, temperature=0.3)
+    rule = call_llm(None, REFLECT_PROMPT.format(reflection=reflection), max_tokens=50, temperature=0.3)
+    if not rule or rule.strip() == EMPTY_RESULT:
+        return reflection[:200] if reflection else "Learn from experience"
+    return rule.strip()
 
 
 def handler(args, **kwargs):
