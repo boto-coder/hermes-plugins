@@ -5,22 +5,16 @@ based on what she learns. Adds a "Learned Behaviors" section to SOUL.md
 that grows organically from experience.
 
 Runs during self-improve cron (3am) or on-demand.
-Uses local model (qwen35-4b) for reflection — $0 cost.
+Uses this profile's configured model for reflection — $0 cost via Nous Portal.
 """
 
 import json
 import os
 import time
+import subprocess
 from pathlib import Path
 
-import importlib.util as _iu, os as _os
-_spec = _iu.spec_from_file_location("evey_utils", _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py"))
-_eu = _iu.module_from_spec(_spec)
-_spec.loader.exec_module(_eu)
-call_llm = _eu.call_llm
-
 SOUL_PATH = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "SOUL.md"
-REFLECT_MODEL = "qwen35-4b"
 MAX_LEARNED = 10  # Max learned behaviors to keep
 
 SCHEMA = {
@@ -59,9 +53,30 @@ Rules:
 Behavioral rule:"""
 
 
+def _hermes_config():
+    """Read this Hermes profile's configured model."""
+    try:
+        out = subprocess.run(
+            ["hermes", "config", "get", "model"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
 def _extract_rule(reflection):
-    """Use cheap local model to distill reflection into a rule."""
-    return call_llm(REFLECT_MODEL, REFLECT_PROMPT.format(reflection=reflection), max_tokens=50, temperature=0.3)
+    """Use this profile's configured model to distill reflection into a rule."""
+    model = _hermes_config()
+    if not model:
+        return None
+    import importlib.util as _iu, os as _os
+    _spec = _iu.spec_from_file_location("evey_utils", _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py"))
+    _eu = _iu.module_from_spec(_spec)
+    _spec.loader.exec_module(_eu)
+    return _eu.call_llm(model, REFLECT_PROMPT.format(reflection=reflection), max_tokens=50, temperature=0.3)
 
 
 def handler(args, **kwargs):
@@ -69,7 +84,6 @@ def handler(args, **kwargs):
         reflection = args.get("reflection", "")
         explicit_behavior = args.get("behavior", "")
 
-        # Get or extract the behavior rule
         if explicit_behavior:
             rule = explicit_behavior
         else:
@@ -77,29 +91,23 @@ def handler(args, **kwargs):
             if not rule:
                 return json.dumps({"status": "skipped", "reason": "Could not extract rule"})
 
-        # Read current SOUL.md
         if not SOUL_PATH.exists():
             return json.dumps({"error": "SOUL.md not found"})
 
         content = SOUL_PATH.read_text()
 
-        # Add or update Learned Behaviors section
         marker = "## Learned Behaviors"
         date = time.strftime("%Y-%m-%d")
 
         if marker in content:
-            # Extract existing behaviors
             parts = content.split(marker)
             before = parts[0]
             behaviors_text = parts[1] if len(parts) > 1 else ""
             behaviors = [l.strip() for l in behaviors_text.strip().split("\n") if l.strip().startswith("- ")]
-            # Add new behavior
             behaviors.append(f"- {rule} ({date})")
-            # Keep only the latest MAX_LEARNED
             behaviors = behaviors[-MAX_LEARNED:]
             content = before + marker + "\n" + "\n".join(behaviors) + "\n"
         else:
-            # Create new section
             content += f"\n{marker}\n- {rule} ({date})\n"
 
         SOUL_PATH.write_text(content)
@@ -108,7 +116,7 @@ def handler(args, **kwargs):
             "status": "updated",
             "rule_added": rule,
             "reflection": reflection[:200],
-            "total_behaviors": len([l for l in content.split("\n") if l.strip().startswith("- ") and "Learned" in content.split(l)[0]]),
+            "total_behaviors": len([l for l in content.split("\n") if l.strip().startswith("- ") and "Learned" in content]),
         })
 
     except Exception as e:

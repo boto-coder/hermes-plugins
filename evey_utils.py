@@ -13,11 +13,71 @@ import os
 import time
 import urllib.request
 import urllib.error
+import subprocess
 
 logger = logging.getLogger("evey.utils")
 
 LITELLM_URL = os.environ.get("OPENAI_BASE_URL", "")
 LITELLM_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+
+def _hermes_config():
+    """Read this Hermes profile's configured model and provider."""
+    result = {}
+    try:
+        out = subprocess.run(
+            ["hermes", "config", "get", "model"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            result["model"] = out.stdout.strip() or None
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["hermes", "config", "get", "provider"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            result["provider"] = out.stdout.strip() or None
+    except Exception:
+        pass
+    return result
+
+
+def _resolve_model(model):
+    """Return a model string to use for an LLM call.
+
+    Falls back from the requested model to this profile's configured model,
+    then to OPENAI_BASE_URL / OPENAI_API_KEY if set, then to None.
+    """
+    if model and model != "auto":
+        return model
+    cfg = _hermes_config()
+    if cfg.get("model"):
+        return cfg["model"]
+    if LITELLM_URL or LITELLM_KEY:
+        return os.environ.get("LITELLM_MODEL", "default")
+    return None
+
+
+def _resolve_endpoint():
+    """Return the base URL for LLM calls.
+
+    Prefers this profile's configured provider, then LiteLLM env, then None.
+    """
+    cfg = _hermes_config()
+    if cfg.get("provider"):
+        return cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL", "")
+    return LITELLM_URL
+
+
+def _resolve_key():
+    """Return the API key to use for LLM calls."""
+    cfg = _hermes_config()
+    if cfg.get("provider"):
+        return os.environ.get("OPENAI_API_KEY", "") or os.environ.get("HERMES_API_KEY", "")
+    return LITELLM_KEY
 
 
 def call_llm(model, prompt, max_tokens=200, temperature=0.3, retries=2):
@@ -27,13 +87,24 @@ def call_llm(model, prompt, max_tokens=200, temperature=0.3, retries=2):
 
 
 def call_model(model, prompt, max_tokens=2000, temperature=0.7, retries=2, timeout=60):
-    """Full LLM call via LiteLLM with retry, reasoning recovery, and usage tracking.
+    """Full LLM call via LiteLLM or this profile's configured model.
 
     Returns dict: {"content": str, "tokens": int, "model": str, "attempts": int}
     Returns None on total failure.
     """
+    resolved_model = _resolve_model(model)
+    resolved_url = _resolve_endpoint()
+    resolved_key = _resolve_key()
+
+    if not resolved_url:
+        logger.error("No LLM endpoint configured")
+        return None
+    if not resolved_key:
+        logger.error("No LLM API key configured")
+        return None
+
     data = json.dumps({
-        "model": model,
+        "model": resolved_model or "default",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -42,11 +113,11 @@ def call_model(model, prompt, max_tokens=2000, temperature=0.7, retries=2, timeo
     for attempt in range(1, retries + 2):
         try:
             req = urllib.request.Request(
-                f"{LITELLM_URL}/chat/completions",
+                f"{resolved_url}/chat/completions",
                 data=data,
                 headers={
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {LITELLM_KEY}",
+                    "Authorization": f"Bearer {resolved_key}",
                 },
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -56,67 +127,38 @@ def call_model(model, prompt, max_tokens=2000, temperature=0.7, retries=2, timeo
             content = msg.get("content", "") or ""
             usage = result.get("usage", {})
 
-            # Reasoning recovery — extract from think-only responses
             if not content.strip():
-                reasoning = (
-                    msg.get("reasoning_content")
-                    or msg.get("reasoning")
-                    or (msg.get("provider_specific_fields") or {}).get("reasoning_content")
-                )
-                if reasoning and str(reasoning).strip():
-                    content = str(reasoning).strip()
-
-            if not content.strip():
-                if attempt <= retries:
-                    time.sleep(2 ** (attempt - 1))
-                    continue
-                return None
+                content = result.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
 
             return {
-                "content": content.strip(),
+                "content": content,
                 "tokens": usage.get("total_tokens", 0),
-                "model": model,
+                "model": resolved_model or "default",
                 "attempts": attempt,
             }
-
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, KeyError) as e:
-            if attempt <= retries:
-                time.sleep(2 ** (attempt - 1))
-                continue
-            logger.warning(f"call_model({model}) failed after {retries + 1} attempts: {e}")
-            return None
         except Exception as e:
-            logger.warning(f"call_model({model}) unexpected error: {e}")
-            return None
+            logger.debug(f"LLM call attempt {attempt} failed: {e}")
+            if attempt == retries + 1:
+                return None
+    return None
 
 
-def http_get(url, timeout=10):
-    """HTTP GET with error handling. Returns response text or None."""
+def http_get(url, timeout=10, headers=None):
+    """GET request with timeout. Returns parsed JSON or None."""
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return resp.read().decode()
-    except Exception:
-        return None
-
-
-def http_get_json(url, timeout=10):
-    """HTTP GET returning parsed JSON dict or None."""
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except Exception:
-        return None
-
-
-def http_post_json(url, data_dict, headers=None, timeout=10):
-    """HTTP POST JSON with error handling. Returns parsed dict or None."""
-    try:
-        data = json.dumps(data_dict).encode()
-        hdrs = {"Content-Type": "application/json"}
-        if headers:
-            hdrs.update(headers)
-        req = urllib.request.Request(url, data=data, headers=hdrs)
+        req = urllib.request.Request(url, headers=headers or {})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def http_post_json(url, body, timeout=10, headers=None):
+    """POST JSON with timeout. Returns parsed JSON or None."""
+    try:
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
     except Exception:
         return None

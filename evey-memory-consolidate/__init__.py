@@ -1,25 +1,22 @@
 """Evey Memory Consolidation — extracts facts from daily conversations.
 
-Runs daily at 3am. Queries Langfuse for yesterday's traces, uses local
-qwen35-4b to extract key facts, updates MEMORY.md and Qdrant vectors.
+Runs daily via cron. Queries this Hermes profile's session history
+(~/.hermes/state.db SQLite messages table) for the last N hours,
+uses this profile's configured model to extract key facts, and
+updates MEMORY.md. No Qdrant, no Ollama, no Langfuse.
 """
 
 import json
 import os
 import time
+import sqlite3
 import urllib.request
 import urllib.error
-from base64 import b64encode
 from pathlib import Path
 
 LITELLM_URL = os.environ.get("OPENAI_BASE_URL", "")
 LITELLM_KEY = os.environ.get("OPENAI_API_KEY", "")
-LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "")
-QDRANT_URL = "http://hermes-qdrant:6333"
-OLLAMA_URL = "http://hermes-ollama:11434"
 MEMORY_PATH = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "memories" / "MEMORY.md"
-EXTRACT_MODEL = "mimo-v2-pro"
-EMBED_MODEL = "snowflake-arctic-embed2"
 CHAR_LIMIT = 4200
 
 SCORE_PROMPT = """Rate the importance of this fact for an AI agent's long-term memory (1-10).
@@ -50,8 +47,8 @@ KEY FACTS:"""
 SCHEMA = {
     "name": "consolidate_daily_memory",
     "description": (
-        "Extract key facts from yesterday's conversations and store them. "
-        "Updates MEMORY.md with new learnings and adds vectors to Qdrant. "
+        "Extract key facts from recent conversations and store them. "
+        "Updates MEMORY.md with new learnings. "
         "Run this daily or when you want to consolidate recent knowledge."
     ),
     "parameters": {
@@ -66,29 +63,31 @@ SCHEMA = {
 }
 
 
-def _langfuse_query(hours_back=24):
-    from_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - hours_back * 3600))
-    lf_pub = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
-    lf_sec = os.environ.get("LANGFUSE_SECRET_KEY", "")
-    auth = b64encode(f"{lf_pub}:{lf_sec}".encode()).decode()
-    url = f"{LANGFUSE_HOST}/api/public/traces?fromTimestamp={from_ts}"
+def _session_traces(hours_back=24):
+    """Query this Hermes profile's session history for recent messages."""
+    db_path = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "state.db"
+    if not db_path.exists():
+        return []
     try:
-        req = urllib.request.Request(url, headers={"Authorization": f"Basic {auth}"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        traces = data.get("data", [])
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        conn.row_factory = sqlite3.Row
+        cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - hours_back * 3600))
+        rows = conn.execute(
+            "SELECT session_id, message, role, created_at FROM messages "
+            "WHERE created_at >= ? ORDER BY created_at DESC LIMIT 100",
+            (cutoff,),
+        ).fetchall()
+        conn.close()
         summaries = []
-        for t in traces[:20]:
-            name = t.get("name", "")
-            inp = t.get("input", "")
-            out = t.get("output", "")
-            if isinstance(inp, dict): inp = inp.get("messages", [{}])[-1].get("content", "") if isinstance(inp.get("messages"), list) else str(inp)[:200]
-            if isinstance(out, dict): out = out.get("choices", [{}])[0].get("message", {}).get("content", "") if isinstance(out.get("choices"), list) else str(out)[:200]
-            if inp or out:
-                summaries.append(f"{name}: {str(inp)[:150]} -> {str(out)[:150]}")
+        for r in rows:
+            role = r["role"] or ""
+            msg = r["message"] or ""
+            if isinstance(msg, dict):
+                msg = msg.get("content", "") if isinstance(msg.get("content"), str) else str(msg)[:200]
+            summaries.append(f"{role}: {str(msg)[:150]}")
         return summaries
     except Exception:
-        return ["Memory consolidation unavailable"]
+        return []
 
 
 def _load_call_llm():
@@ -102,14 +101,14 @@ def _load_call_llm():
 def _extract_facts(trace_summaries):
     call_llm = _load_call_llm()
     text = "\n".join(trace_summaries[:15])
-    result = call_llm(EXTRACT_MODEL, EXTRACT_PROMPT.format(traces=text[:3000]), max_tokens=300, temperature=0.3)
+    result = call_llm(None, EXTRACT_PROMPT.format(traces=text[:3000]), max_tokens=300, temperature=0.3)
     return result or "Extraction failed"
 
 
 def _score_fact(fact):
-    """Score a fact's importance (1-10) using local model."""
+    """Score a fact's importance (1-10) using this profile's model."""
     call_llm = _load_call_llm()
-    text = call_llm(EXTRACT_MODEL, SCORE_PROMPT.format(fact=fact), max_tokens=5, temperature=0)
+    text = call_llm(None, SCORE_PROMPT.format(fact=fact), max_tokens=5, temperature=0)
     if text:
         try:
             return int("".join(c for c in text if c.isdigit())[:2])
@@ -122,7 +121,6 @@ def _update_memory(new_facts):
     MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     current = MEMORY_PATH.read_text() if MEMORY_PATH.exists() else ""
 
-    # Score each fact and only keep important ones (score >= 5)
     scored_facts = []
     for fact in new_facts.split("\n"):
         if fact.strip() and fact.strip().startswith("-"):
@@ -136,10 +134,8 @@ def _update_memory(new_facts):
     date_header = f"\n## Learned {time.strftime('%Y-%m-%d')}\n"
     updated = current + date_header + "\n".join(scored_facts) + "\n"
 
-    # Trim: remove oldest LOW-scored facts first when over limit
     if len(updated) > CHAR_LIMIT:
         lines = updated.split("\n")
-        # Sort removable lines by importance (keep headers/structure)
         removable = [(i, l) for i, l in enumerate(lines) if "[importance:" in l]
         removable.sort(key=lambda x: int(x[1].split("importance:")[1].split("]")[0]) if "importance:" in x[1] else 10)
         while len("\n".join(lines)) > CHAR_LIMIT and removable:
@@ -153,44 +149,14 @@ def _update_memory(new_facts):
     return len(updated)
 
 
-def _embed_to_qdrant(facts):
-    import hashlib
-    for i, fact in enumerate(facts.split("\n")):
-        if not fact.strip() or not fact.startswith("-"):
-            continue
-        try:
-            data = json.dumps({"model": EMBED_MODEL, "prompt": fact}).encode()
-            req = urllib.request.Request(f"{OLLAMA_URL}/api/embeddings", data=data,
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                vector = json.loads(resp.read())["embedding"]
-            point_id = int(hashlib.md5(f"memory:{time.strftime('%Y%m%d')}:{i}".encode()).hexdigest()[:15], 16)
-            # Extract category from fact format "- [category] fact text"
-            category = "general"
-            fact_text = fact.strip()
-            if fact_text.startswith("- [") and "]" in fact_text:
-                category = fact_text.split("[")[1].split("]")[0]
-            upsert = json.dumps({"points": [{"id": point_id, "vector": vector, "payload": {
-                "source": "memory-consolidation", "type": "learned-fact",
-                "category": category,
-                "content": fact_text, "date": time.strftime("%Y-%m-%d"),
-            }}]}).encode()
-            req = urllib.request.Request(f"{QDRANT_URL}/collections/evey-knowledge/points",
-                data=upsert, method="PUT", headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass
-
-
 def handler(args, **kwargs):
     try:
         hours = args.get("hours_back", 24)
-        traces = _langfuse_query(hours)
+        traces = _session_traces(hours)
         if not traces:
-            return json.dumps({"status": "empty", "message": "No traces found"})
+            return json.dumps({"status": "empty", "message": "No session traces found"})
         facts = _extract_facts(traces)
         mem_size = _update_memory(facts)
-        _embed_to_qdrant(facts)
         return json.dumps({
             "status": "consolidated",
             "traces_analyzed": len(traces),
