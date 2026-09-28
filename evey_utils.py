@@ -26,20 +26,38 @@ def _hermes_config():
     result = {}
     try:
         out = subprocess.run(
-            ["hermes", "config", "get", "model"],
+            ["hermes", "config", "get", "model.default"],
             capture_output=True, text=True, timeout=10,
         )
-        if out.returncode == 0:
-            result["model"] = out.stdout.strip() or None
+        if out.returncode == 0 and out.stdout.strip():
+            result["model"] = out.stdout.strip()
     except Exception:
         pass
     try:
         out = subprocess.run(
-            ["hermes", "config", "get", "provider"],
+            ["hermes", "config", "get", "model.provider"],
             capture_output=True, text=True, timeout=10,
         )
-        if out.returncode == 0:
-            result["provider"] = out.stdout.strip() or None
+        if out.returncode == 0 and out.stdout.strip():
+            result["provider"] = out.stdout.strip()
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["hermes", "config", "get", "model.base_url"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            result["base_url"] = out.stdout.strip()
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["hermes", "config", "get", "model.api_key"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            result["api_key"] = out.stdout.strip()
     except Exception:
         pass
     return result
@@ -62,22 +80,23 @@ def _resolve_model(model):
 
 
 def _resolve_endpoint():
-    """Return the base URL for LLM calls.
-
-    Prefers this profile's configured provider, then LiteLLM env, then None.
-    """
+    """Return the base URL for LLM calls."""
     cfg = _hermes_config()
+    if cfg.get("base_url"):
+        return cfg["base_url"]
     if cfg.get("provider"):
-        return cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL", "")
+        return os.environ.get("OPENAI_BASE_URL", "")
     return LITELLM_URL
 
 
 def _resolve_key():
     """Return the API key to use for LLM calls."""
     cfg = _hermes_config()
-    if cfg.get("provider"):
-        return os.environ.get("OPENAI_API_KEY", "") or os.environ.get("HERMES_API_KEY", "")
-    return LITELLM_KEY
+    if cfg.get("api_key"):
+        return cfg["api_key"]
+    if LITELLM_KEY:
+        return LITELLM_KEY
+    return os.environ.get("HERMES_API_KEY", "")
 
 
 def call_llm(model, prompt, max_tokens=200, temperature=0.3, retries=2):
